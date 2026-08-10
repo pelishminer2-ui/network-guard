@@ -19,7 +19,7 @@ DEFAULTS: Dict[str, Any] = {
     "dashboard_port": 8765,
     "temp_block_minutes": 60,
     "baseline_enabled": True,
-    "notify_on_new_device": True,
+    "notify_on_new_device": False,
     "history_db": "history.db",
     "watchlist": [],
     "reputation_blocklist": "reputation_blocklist.txt",

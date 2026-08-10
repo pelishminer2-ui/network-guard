@@ -8,7 +8,7 @@ quiet_watch_default: true
 dashboard_port: 8765
 temp_block_minutes: 60
 baseline_enabled: true
-notify_on_new_device: true
+notify_on_new_device: false
 history_db: history.db
 reputation_blocklist: reputation_blocklist.txt
 

@@ -4,10 +4,12 @@ title Network Guard
 cd /d "%~dp0"
 
 echo ============================================
-echo  Network Guard - local + LAN triage
+echo  Network Guard - scan + results
 echo ============================================
 echo.
-
+echo Scans this PC and your LAN, then shows findings.
+echo For each threat: View / Kill / Block / Allow / Skip.
+echo.
 REM Prefer py launcher, then python, then python3
 set "PY="
 where py >nul 2>&1 && set "PY=py -3"
@@ -31,10 +33,10 @@ if errorlevel 1 (
 )
 
 echo Running elevated.
-echo For each threat you can View / Kill / Block / Allow / Skip.
 echo.
 REM Interactive by default. Pass --yes for unattended auto-block.
 REM Pass --dry-run to inspect without changing anything.
+REM Optional web UI: run_dashboard.bat (not required).
 %PY% "%~dp0network_guard.py" --lan %*
 set "EC=%ERRORLEVEL%"
 echo.
