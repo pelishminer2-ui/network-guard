@@ -1052,8 +1052,8 @@ def show_threat_view(
         else:
             print("    (none right now - device is reachable/open but idle toward you)")
         print(
-            "  Note: press [U] to view this device's screen "
-            "(needs Network Guard Agent on that device, or RDP)."
+            "  Note: press [U] for quiet browser watch "
+            "(agent/local capture only; no RDP). Use [V] for network-only."
         )
         print("=" * 64)
         return
@@ -1808,21 +1808,40 @@ def view_compromised_ui(
     finding: Connection,
     lan_hosts: List[LanHost],
     log_path: Path,
+    *,
+    quiet: bool = True,
 ) -> None:
-    """Show the actual on-screen UI of the compromised local process or LAN device."""
+    """
+    Watch the flagged UI in the browser.
+
+    Quiet mode (default):
+      - no RDP session
+      - no bringing windows to the foreground
+      - local window/desktop capture, or Network Guard Agent stream only
+    """
     is_lan = finding.proto == "lan"
     device_names = load_device_names()
+
+    print()
+    if quiet:
+        print("  Quiet watch mode: no RDP, no window focus steal.")
+    else:
+        print("  Loud watch mode: may focus windows or open RDP.")
 
     if not is_lan:
         if not finding.pid:
             print("  No PID available to capture a window.")
             return
 
-        focused = focus_process_window(finding.pid)
-        if focused:
-            print(f"  Brought window to foreground: {focused}")
+        if not quiet:
+            focused = focus_process_window(finding.pid)
+            if focused:
+                print(f"  Brought window to foreground: {focused}")
         else:
-            print("  No visible window for this process - showing desktop capture in browser.")
+            print(
+                f"  Capturing PID {finding.pid} in the background "
+                "(window will not be raised)."
+            )
 
         def grab():
             return capture_local_ui(finding.pid)
@@ -1831,20 +1850,27 @@ def view_compromised_ui(
             img, meta = grab()
             path = save_ui_capture(img, f"pid{finding.pid}")
             print(f"  Snapshot saved: {path} ({meta})")
-            # Also open the still in the default app immediately for clarity
-            try:
-                if is_windows():
-                    os.startfile(path)  # type: ignore[attr-defined]
-            except OSError:
-                pass
+            # Open still only in loud mode; quiet mode uses the browser feed only
+            if not quiet:
+                try:
+                    if is_windows():
+                        os.startfile(path)  # type: ignore[attr-defined]
+                except OSError:
+                    pass
         except Exception as exc:
             log(f"Initial UI capture failed: {exc}", log_path)
 
         live_ui_viewer(
             grab,
             title=f"{finding.process_name or 'Process'} (PID {finding.pid})",
-            subtitle=f"Local threat view - remote {finding.remote_ip}:{finding.remote_port}",
+            subtitle=(
+                "Quiet local watch - background capture, no focus steal"
+                if quiet
+                else f"Local threat view - remote {finding.remote_ip}:{finding.remote_port}"
+            ),
             log_path=log_path,
+            mode="ui",
+            badge="Quiet local watch" if quiet else "Local watch",
         )
         return
 
@@ -1858,23 +1884,10 @@ def view_compromised_ui(
         or ip
     )
     token = load_agent_token()
-    print()
-    print(f"  Attempting to view UI on LAN device {friendly} ({ip}) ...")
-
-    # Prefer RDP browser session when Remote Desktop is available
-    rdp_open = False
-    if host and 3389 in (host.open_ports or []):
-        rdp_open = True
-    else:
-        rdp_open = tcp_port_open(ip, 3389, timeout=0.5)
-
-    if rdp_open and is_windows():
-        print("  RDP (3389) is open - starting Remote Desktop and mirroring it in your browser.")
-        start_rdp_browser_session(ip, friendly, log_path)
-        return
+    print(f"  Quiet watch for LAN device {friendly} ({ip}) ...")
 
     if token and agent_reachable(ip, token):
-        print("  Network Guard Agent detected - streaming live screen into your browser.")
+        print("  Network Guard Agent found - streaming screen to your browser (no RDP).")
 
         def grab_remote():
             img = fetch_agent_screenshot(ip, token)
@@ -1884,32 +1897,39 @@ def view_compromised_ui(
             img, meta = grab_remote()
             path = save_ui_capture(img, f"lan_{ip.replace('.', '_')}")
             print(f"  Snapshot saved: {path}")
-            try:
-                if is_windows():
-                    os.startfile(path)  # type: ignore[attr-defined]
-            except OSError:
-                pass
         except Exception as exc:
             log(f"Remote snapshot failed: {exc}", log_path)
         live_ui_viewer(
             grab_remote,
             title=f"{friendly} ({ip})",
-            subtitle="LAN device live screen via Network Guard Agent",
+            subtitle="Quiet LAN watch via Network Guard Agent (no RDP session)",
             log_path=log_path,
             mode="ui",
-            badge="Live agent screen",
+            badge="Quiet agent watch",
         )
         return
 
-    print("  No RDP service and no Network Guard Agent on that device.")
+    print("  No Network Guard Agent on that device - cannot quietly view its screen.")
+    print("  Quiet options:")
+    print("    1) Copy run_network_guard_agent.bat + network_guard_agent.py to that PC")
+    print("    2) Run the agent there, keep agent_token.txt identical on both PCs")
+    print("    3) Press [U] again")
+    print("  Or use [V] to watch network activity only (no screen, fully quiet).")
     if not token:
-        print(f"  Tip: matching {AGENT_TOKEN_FILE.name} on both PCs enables agent screen view.")
-    print("  Options:")
-    print("    - Enable Remote Desktop on that Windows PC (port 3389), then press [U] again")
-    print("    - Or run run_network_guard_agent.bat on that device, copy agent_token.txt here")
-    ans = prompt_choice("  Try opening RDP anyway (may fail if disabled)? [y/N]: ")
-    if ans in ("y", "yes") and is_windows():
-        start_rdp_browser_session(ip, friendly, log_path)
+        print(f"  Missing token file: {AGENT_TOKEN_FILE}")
+
+    # RDP is opt-in only (loud) — never the quiet default
+    rdp_open = False
+    if host and 3389 in (host.open_ports or []):
+        rdp_open = True
+    else:
+        rdp_open = tcp_port_open(ip, 3389, timeout=0.5)
+    if rdp_open and is_windows():
+        ans = prompt_choice(
+            "  RDP is available but is LOUD (visible session). Open RDP mirror anyway? [y/N]: "
+        )
+        if ans in ("y", "yes"):
+            start_rdp_browser_session(ip, friendly, log_path)
 
 
 def triage_finding(
@@ -1934,8 +1954,8 @@ def triage_finding(
     while True:
         print()
         print("  Decide what to do with this threat:")
-        print("    [U]  Open RDP/live UI in your web browser (watch threat screen)")
-        print("    [V]  View live network activity (connections ~10s)")
+        print("    [U]  Quiet watch in browser (no RDP, no focus steal)")
+        print("    [V]  View live network activity only (connections ~10s)")
         if not is_lan:
             print("    [K]  Kill the process")
         print("    [B]  Block the IP in the firewall")
