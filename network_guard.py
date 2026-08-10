@@ -848,6 +848,13 @@ def enrich_and_detect(
     seen: Set[str] = set()
     state = allow_state if allow_state is not None else load_allow_state(state_path)
     device_names = load_device_names()
+    dns_names: Dict[str, str] = {}
+    try:
+        from ng_dns import dns_cache_map
+
+        dns_names = dns_cache_map()
+    except Exception:
+        dns_names = {}
 
     if log_path:
         log("Loading process list (one-shot)...", log_path)
@@ -867,6 +874,9 @@ def enrich_and_detect(
         reasons = score_connection(conn, allowlist, blocklist)
         if not reasons:
             continue
+        dns_name = dns_names.get(conn.remote_ip or "")
+        if dns_name:
+            reasons.append(f"dns cache name: {dns_name}")
 
         if conn.remote_ip and not is_local_or_skip(conn.remote_ip):
             fp = fingerprint_from_finding(conn, None)
@@ -982,6 +992,7 @@ def block_ip(
     *,
     allow_private: bool = False,
     protected: Optional[Set[str]] = None,
+    temp_minutes: int = 0,
 ) -> bool:
     protected = protected or set()
     if ip in protected or is_local_or_skip(ip):
@@ -991,8 +1002,85 @@ def block_ip(
         log(f"Refusing to block private LAN address {ip} (use --lan to allow)", log_path)
         return False
     if is_windows():
-        return block_ip_windows(ip, dry_run, log_path)
-    return block_ip_linux(ip, dry_run, log_path)
+        ok = block_ip_windows(ip, dry_run, log_path)
+    else:
+        ok = block_ip_linux(ip, dry_run, log_path)
+    if ok and not dry_run:
+        try:
+            from ng_firewall_ext import track_block, windows_rule_names
+            from ng_history import record_action
+
+            rules = windows_rule_names(ip, RULE_PREFIX) if is_windows() else [f"{RULE_PREFIX}:{ip}"]
+            token = track_block(ip, rules, temp_minutes=temp_minutes)
+            record_action(
+                "temp_block" if temp_minutes else "block",
+                ip,
+                detail=f"minutes={temp_minutes}",
+                undo_token=token,
+            )
+            if temp_minutes:
+                log(f"Temp block tracked for {ip} ({temp_minutes} min) token={token}", log_path)
+        except Exception as exc:
+            log(f"Block tracking note: {exc}", log_path)
+    return ok
+
+
+def isolate_lan_device(
+    ip: str,
+    dry_run: bool,
+    log_path: Path,
+    *,
+    protected: Optional[Set[str]] = None,
+) -> bool:
+    """
+    Stronger local isolation: block the peer both ways, plus a LAN-scoped rule.
+    Full household isolation still requires a router deny rule.
+    """
+    protected = protected or set()
+    if ip in protected or is_local_or_skip(ip):
+        log(f"Refusing to isolate protected/local address {ip}", log_path)
+        return False
+    ok = block_ip(
+        ip, dry_run=dry_run, log_path=log_path, allow_private=True, protected=protected
+    )
+    if not ok:
+        return False
+    if is_windows() and not dry_run:
+        base = f"{RULE_PREFIX}-Isolate-{ip.replace(':', '-')}"
+        cmd = [
+            "netsh",
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            f"name={base}-Lan",
+            "dir=in",
+            "action=block",
+            f"remoteip={ip}",
+            "protocol=any",
+            "enable=yes",
+        ]
+        code, _, err = run_cmd(cmd)
+        if code != 0:
+            log(f"Extra isolate rule note for {ip}: {err.strip()}", log_path)
+        else:
+            log(f"Isolate marker rule added for {ip}", log_path)
+            try:
+                from ng_firewall_ext import track_block, windows_isolate_rule_names
+                from ng_history import record_action
+
+                token = track_block(
+                    ip, windows_isolate_rule_names(ip, RULE_PREFIX), kind="isolate"
+                )
+                record_action("isolate", ip, undo_token=token)
+            except Exception:
+                pass
+    log(
+        "NOTE: This isolates the device from THIS PC. "
+        "For whole-LAN isolation, also deny the IP on your router.",
+        log_path,
+    )
+    return True
 
 
 def kill_process(pid: Optional[int], dry_run: bool, log_path: Path) -> bool:
@@ -2487,9 +2575,12 @@ def triage_finding(
         if not is_lan:
             print("    [K]  Kill the process")
         print("    [B]  Block the IP in the firewall")
+        print("    [T]  Temporary block (auto-expire; default from config)")
+        print("    [I]  Isolate device from this PC (stronger local cut)")
         if not is_lan:
             print("    [KB] Kill process AND block IP")
         print("    [A]  Allow it (add IP to allowlist, stop flagging)")
+        print("    [R]  Open router admin (gateway helper)")
         print("    [S]  Skip (do nothing)")
         print("    [Q]  Quit triage (leave remaining findings alone)")
         choice = prompt_choice("  Your choice: ")
@@ -2567,6 +2658,55 @@ def triage_finding(
                 append_blocklist(finding.remote_ip, blocklist_path)
                 result["blocked"] = True
             return result
+        if choice in ("t", "temp", "temporary"):
+            try:
+                from ng_config import load_config
+
+                minutes = int(load_config().get("temp_block_minutes") or 60)
+            except Exception:
+                minutes = 60
+            if dry_run:
+                log(f"DRY-RUN would temp-block {finding.remote_ip} for {minutes}m", log_path)
+                result["blocked"] = True
+                return result
+            ok = block_ip(
+                finding.remote_ip,
+                dry_run=False,
+                log_path=log_path,
+                allow_private=is_lan or is_private_lan(finding.remote_ip),
+                protected=protected_ips,
+                temp_minutes=minutes,
+            )
+            if ok:
+                append_blocklist(finding.remote_ip, blocklist_path)
+                result["blocked"] = True
+            return result
+        if choice in ("i", "isolate"):
+            if dry_run:
+                log(f"DRY-RUN would isolate {finding.remote_ip}", log_path)
+                result["blocked"] = True
+                return result
+            ok = isolate_lan_device(
+                finding.remote_ip,
+                dry_run=False,
+                log_path=log_path,
+                protected=protected_ips,
+            )
+            if ok:
+                append_blocklist(finding.remote_ip, blocklist_path)
+                result["blocked"] = True
+            return result
+        if choice in ("r", "router"):
+            try:
+                from ng_router import open_gateway_admin
+
+                gw = default_gateway() or ""
+                ok, msg = open_gateway_admin(gw)
+                print(f"  {msg}")
+                log(msg, log_path)
+            except Exception as exc:
+                print(f"  Router helper failed: {exc}")
+            continue
         if choice in ("k", "kill") and not is_lan:
             if dry_run:
                 log(f"DRY-RUN would kill PID {finding.pid}", log_path)
@@ -2597,7 +2737,7 @@ def triage_finding(
                 result["blocked"] = True
             return result
 
-        print("  Invalid choice. Use U / V / K / B / KB / A / S / Q.")
+        print("  Invalid choice. Use U / V / K / B / T / I / KB / A / R / S / Q.")
 
 
 # ---------------------------------------------------------------------------
@@ -2897,6 +3037,17 @@ def scan_lan(
     def scan_one(ip: str) -> LanHost:
         resolved = resolve_hostname(ip)
         friendly = device_names.get(ip) or resolved
+        vendor = ""
+        try:
+            from ng_oui import label_device, vendor_from_mac
+
+            vendor = vendor_from_mac(arp.get(ip, ""))
+            if not friendly:
+                friendly = vendor
+            elif vendor and vendor.lower() not in friendly.lower():
+                friendly = f"{friendly} ({vendor})"
+        except Exception:
+            pass
         host = LanHost(
             ip=ip,
             hostname=friendly,
@@ -2909,14 +3060,52 @@ def scan_lan(
         if ip_in_list(ip, blocklist):
             host.reasons.append("IP on blocklist")
 
-        bad_open = [p for p in host.open_ports if p in SUSPICIOUS_LISTEN_PORTS or p in (23, 2323, 7547)]
+        # Profile-aware: don't flag expected IoT/printer ports as suspicious
+        candidate_ports = list(host.open_ports)
+        try:
+            from ng_profiles import filter_unexpected_ports
+
+            label = f"{friendly} {vendor}"
+            flagged_pool = filter_unexpected_ports(label, candidate_ports)
+        except Exception:
+            flagged_pool = candidate_ports
+
+        bad_open = [p for p in flagged_pool if p in SUSPICIOUS_LISTEN_PORTS or p in (23, 2323, 7547)]
         if bad_open:
             explained = ", ".join(f"{p} ({describe_port(p)})" for p in bad_open)
             host.reasons.append("suspicious open port(s): " + explained)
-        risky_extra = [p for p in host.open_ports if p in (5555, 49152) and p not in bad_open]
+        risky_extra = [p for p in flagged_pool if p in (5555, 49152) and p not in bad_open]
         if risky_extra:
             explained = ", ".join(f"{p} ({describe_port(p)})" for p in risky_extra)
             host.reasons.append("risky service port(s): " + explained)
+
+        # Baseline regression: new ports vs saved baseline
+        try:
+            from ng_config import load_config
+            from ng_history import new_ports_vs_baseline
+
+            if load_config().get("baseline_enabled", True):
+                novel = new_ports_vs_baseline(ip, list(host.open_ports))
+                if novel:
+                    host.reasons.append(
+                        "new vs baseline: "
+                        + ", ".join(f"{p} ({describe_port(p)})" for p in novel)
+                    )
+        except Exception:
+            pass
+
+        # Optional light banner for suspicious hosts only (keeps scan fast)
+        if host.reasons and host.open_ports:
+            try:
+                from ng_banner import grab_banner
+
+                tip = grab_banner(ip, host.open_ports[0], timeout=0.8)
+                if tip.get("server") or tip.get("hint"):
+                    host.reasons.append(
+                        f"service fingerprint: {tip.get('hint') or ''} {tip.get('server') or ''}".strip()
+                    )
+            except Exception:
+                pass
 
         if host.reasons:
             fp = {
@@ -2934,6 +3123,31 @@ def scan_lan(
                 host.reasons = []
             elif note.startswith("allowlisted but traffic worsened"):
                 host.reasons = [note] + host.reasons
+
+        try:
+            from ng_history import upsert_host
+
+            info = upsert_host(
+                ip,
+                mac=host.mac,
+                hostname=host.hostname,
+                vendor=vendor,
+                open_ports=host.open_ports,
+            )
+            if info.get("is_new") and host.reasons:
+                try:
+                    from ng_config import load_config
+                    from ng_notify import notify
+
+                    if load_config().get("notify_on_new_device", True):
+                        notify(
+                            "Network Guard — new suspicious device",
+                            f"{ip} {host.hostname or ''} {','.join(host.reasons[:2])}",
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
         return host
 
     log(
@@ -3118,13 +3332,82 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="Write findings JSON to this path.",
     )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Launch the local web Command Center dashboard.",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run environment self-test and exit.",
+    )
+    parser.add_argument(
+        "--undo",
+        action="store_true",
+        help="Undo the last tracked firewall block and exit.",
+    )
+    parser.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help="After scan, save current LAN ports as baseline.",
+    )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Write an HTML incident report after scan.",
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Faster LAN probe using config quick_ports only.",
+    )
     args = parser.parse_args(argv)
     if args.lan_only:
         args.lan = True
 
+    if args.dashboard:
+        from ng_dashboard import main as dash_main
+
+        return dash_main()
+
+    if args.self_test:
+        from ng_dashboard import self_test
+
+        print(json.dumps(self_test(), indent=2))
+        return 0
+
+    if args.undo:
+        from ng_dashboard import undo_last_block
+
+        print(undo_last_block())
+        return 0
+
     ensure_default_lists()
     log_path: Path = args.log
     disable_console_quick_edit()
+
+    # Expire temporary blocks
+    try:
+        from ng_firewall_ext import pop_expired
+
+        for exp in pop_expired():
+            log(f"Temp block expired for {exp.get('ip')} — removing rules...", log_path)
+            if is_windows():
+                for name in exp.get("rules") or []:
+                    run_cmd(
+                        ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"]
+                    )
+    except Exception:
+        pass
+
+    # Load config + reputation list overlay
+    try:
+        from ng_config import load_config
+
+        CFG = load_config()
+    except Exception:
+        CFG = {}
 
     log("=" * 60, log_path)
     log(
@@ -3149,8 +3432,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def scan_once() -> Tuple[List[Connection], List[LanHost]]:
         allowlist = load_ip_list(args.allowlist)
         blocklist = load_ip_list(args.blocklist)
+        # Reputation overlay (optional local feed)
+        try:
+            rep_name = CFG.get("reputation_blocklist") or "reputation_blocklist.txt"
+            rep = Path(rep_name) if Path(str(rep_name)).is_absolute() else SCRIPT_DIR / str(rep_name)
+            if rep.exists():
+                blocklist |= load_ip_list(rep)
+                log(f"Loaded reputation blocklist: {rep}", log_path)
+        except Exception:
+            pass
+
         findings: List[Connection] = []
         lan_hosts: List[LanHost] = []
+
+        # Watchlist status
+        watch = list(CFG.get("watchlist") or [])
+        if watch:
+            log("Watchlist: " + ", ".join(str(x) for x in watch), log_path)
+
+        # Traffic summary (operator context)
+        try:
+            from ng_traffic import format_top_talkers, top_talkers
+
+            talkers = top_talkers(10)
+            print()
+            print("Top talkers (established):")
+            print(format_top_talkers(talkers))
+            log("Top talkers: " + "; ".join(f"{t.get('ip')}={t.get('connections')}" for t in talkers), log_path)
+        except Exception:
+            pass
+
+        # Router admin hint
+        try:
+            from ng_router import probe_gateway_admin
+
+            gw_urls = probe_gateway_admin(gw or "")
+            if gw_urls:
+                log("Gateway admin candidate(s): " + ", ".join(gw_urls), log_path)
+        except Exception:
+            pass
 
         if not args.lan_only:
             log("Scanning local active connections...", log_path)
@@ -3169,7 +3489,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.lan:
             try:
-                network = guess_subnet(args.subnet)
+                network = guess_subnet(args.subnet or CFG.get("subnet"))
             except (RuntimeError, ValueError) as exc:
                 log(f"LAN scan skipped: {exc}", log_path)
                 return findings, lan_hosts
@@ -3178,15 +3498,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "To protect phones/TVs/other PCs, also block flagged IPs on your router.",
                 log_path,
             )
+            ports = LAN_PROBE_PORTS
+            if args.quick:
+                qp = CFG.get("quick_ports") or list(LAN_PROBE_PORTS)
+                ports = tuple(int(p) for p in qp)
+                log(f"Quick scan ports: {','.join(str(p) for p in ports)}", log_path)
             lan_hosts = scan_lan(
                 network,
                 allowlist,
                 blocklist,
                 log_path,
-                workers=max(8, args.lan_workers),
-                port_timeout=max(0.1, args.lan_port_timeout),
+                workers=max(8, args.lan_workers or int(CFG.get("lan_workers") or 48)),
+                port_timeout=max(
+                    0.1,
+                    args.lan_port_timeout
+                    if args.lan_port_timeout
+                    else float(CFG.get("lan_port_timeout") or 0.35),
+                ),
+                ports=ports,
                 allow_state=load_allow_state(),
             )
+            # Highlight watchlist devices
+            if watch:
+                print()
+                print("Watchlist status:")
+                by_ip = {h.ip: h for h in lan_hosts}
+                for wip in watch:
+                    h = by_ip.get(str(wip))
+                    if not h:
+                        print(f"  {wip:<16} OFFLINE / not seen")
+                        continue
+                    ports_s = ",".join(str(p) for p in h.open_ports) or "-"
+                    flag = "SUSPICIOUS" if h.suspicious else "ok"
+                    print(f"  {h.ip:<16} {(h.hostname or '-'):<24} ports={ports_s} [{flag}]")
+
             print_lan_inventory(lan_hosts)
             for h in lan_hosts:
                 log(
@@ -3275,14 +3620,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     break
 
         if blocked:
-            export = SCRIPT_DIR / "router_block_candidates.txt"
-            with export.open("w", encoding="utf-8") as fh:
-                fh.write(
-                    "# Paste these into your router firewall / parental controls / deny list\n"
-                    "# Generated by Network Guard\n"
-                )
-                for ip in sorted(blocked, key=lambda x: tuple(int(p) for p in x.split("."))):
-                    fh.write(ip + "\n")
+            try:
+                from ng_router import export_router_blocks
+
+                export = export_router_blocks(sorted(blocked))
+            except Exception:
+                export = SCRIPT_DIR / "router_block_candidates.txt"
+                with export.open("w", encoding="utf-8") as fh:
+                    fh.write(
+                        "# Paste these into your router firewall / parental controls / deny list\n"
+                        "# Generated by Network Guard\n"
+                    )
+                    for ip in sorted(blocked, key=lambda x: tuple(int(p) for p in x.split("."))):
+                        fh.write(ip + "\n")
             log(f"Wrote router block candidates: {export}", log_path)
 
         log(
@@ -3291,21 +3641,110 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log_path,
         )
 
+    _post_scan_artifacts.save_baseline = bool(args.save_baseline)
+    _post_scan_artifacts.report = bool(args.report)
+    _post_scan_artifacts.log_path = log_path
+
     try:
         if args.watch and args.watch > 0:
             log(f"Watch mode every {args.watch}s (Ctrl+C to stop).", log_path)
             while True:
                 findings, lan_hosts = scan_once()
                 remediate(findings, lan_hosts)
+                _post_scan_artifacts(findings, lan_hosts)
                 time.sleep(args.watch)
         else:
             findings, lan_hosts = scan_once()
             remediate(findings, lan_hosts)
+            _post_scan_artifacts(findings, lan_hosts)
     except KeyboardInterrupt:
         log("Interrupted.", log_path)
         return 130
 
     return 0
+
+
+def _post_scan_artifacts(findings: List[Connection], lan_hosts: List[LanHost]) -> None:
+    """Baseline / HTML report / agent fleet / cert tips after a scan."""
+    try:
+        from ng_history import last_actions, save_baseline
+        from ng_report import write_incident_report
+
+        save_bl = getattr(_post_scan_artifacts, "save_baseline", False)
+        do_report = getattr(_post_scan_artifacts, "report", False)
+        log_path = getattr(_post_scan_artifacts, "log_path", DEFAULT_LOG)
+
+        host_dicts = [
+            {
+                "ip": h.ip,
+                "hostname": h.hostname,
+                "vendor": "",
+                "mac": h.mac,
+                "open_ports": h.open_ports,
+            }
+            for h in lan_hosts
+        ]
+        if save_bl and host_dicts:
+            n = save_baseline(host_dicts)
+            log(f"Saved baseline for {n} host(s).", log_path)
+
+        if do_report:
+            finding_dicts = [
+                {
+                    "ip": f.remote_ip,
+                    "proto": f.proto,
+                    "ports": [f.remote_port] if f.remote_port else [],
+                    "reasons": f.reasons,
+                }
+                for f in findings
+            ]
+            path = write_incident_report(
+                findings=finding_dicts,
+                lan_hosts=host_dicts,
+                actions=last_actions(50),
+            )
+            log(f"Wrote incident report: {path}", log_path)
+            print(f"Incident report: {path}")
+
+        agents_file = SCRIPT_DIR / "agents.txt"
+        if agents_file.exists():
+            print()
+            print("Agent fleet:")
+            for line in agents_file.read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                hostport = line
+                try:
+                    import urllib.request
+
+                    url = (
+                        hostport
+                        if hostport.startswith("http")
+                        else f"http://{hostport}/health"
+                    )
+                    with urllib.request.urlopen(url, timeout=2) as resp:
+                        print(f"  ONLINE  {url} ({resp.status})")
+                except Exception:
+                    print(f"  OFFLINE {hostport}")
+
+        try:
+            from ng_cert import scan_lan_certs
+
+            for c in scan_lan_certs(host_dicts):
+                if c.get("warnings"):
+                    log(
+                        f"Cert {c.get('ip')}:{c.get('port')} cn={c.get('cn')} "
+                        f"warn={'; '.join(c['warnings'])}",
+                        log_path,
+                    )
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            log(f"Post-scan artifacts note: {exc}", DEFAULT_LOG)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

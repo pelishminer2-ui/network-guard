@@ -1,0 +1,5 @@
+# Optional reputation / known-bad IPs or CIDRs (one per line).
+# Copied into blocklist scoring during dashboard/CLI scans when present.
+# Example:
+# 203.0.113.10
+# 198.51.100.0/24
