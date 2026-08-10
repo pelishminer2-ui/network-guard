@@ -60,6 +60,85 @@ SUSPICIOUS_PROCESS_NAMES: Set[str] = {
     "mimikatz", "cobaltstrike", "beacon",
 }
 
+# What each port is normally used for (shown to the threat analyst)
+PORT_USAGE: Dict[int, str] = {
+    20: "FTP data transfer",
+    21: "FTP file transfer control",
+    22: "SSH remote shell / secure admin",
+    23: "Telnet (cleartext remote login — often risky/legacy)",
+    25: "SMTP email sending",
+    53: "DNS name resolution",
+    80: "HTTP web traffic",
+    110: "POP3 email retrieval",
+    135: "Windows RPC endpoint mapper",
+    139: "NetBIOS session service",
+    143: "IMAP email",
+    443: "HTTPS secure web traffic",
+    445: "SMB Windows file/printer sharing",
+    993: "IMAPS secure email",
+    995: "POP3S secure email",
+    1080: "SOCKS proxy (sometimes abused for tunneling)",
+    1234: "Often used by demos/malware listeners",
+    1337: "Common hacker/backdoor joke port (elite)",
+    1433: "Microsoft SQL Server",
+    1521: "Oracle database",
+    1723: "PPTP VPN",
+    2222: "Alternate SSH or backdoor listeners",
+    2323: "Alternate Telnet (common on IoT)",
+    3128: "HTTP proxy (Squid-style)",
+    3306: "MySQL database",
+    3389: "Remote Desktop (RDP)",
+    4443: "Alternate HTTPS / sometimes malware C2",
+    4444: "Common Metasploit/meterpreter listener port",
+    4899: "Radmin remote control",
+    5000: "UPnP / Flask/dev web apps / some NAS UIs",
+    5432: "PostgreSQL database",
+    5555: "Android ADB / some remote-admin tools",
+    5800: "VNC over HTTP",
+    5900: "VNC remote desktop",
+    5901: "VNC display :1",
+    6666: "IRC alternate / common backdoor port",
+    6667: "IRC chat",
+    6668: "IRC alternate",
+    6669: "IRC alternate",
+    7547: "TR-069 router/modem remote management (often probed)",
+    7777: "Game servers / occasional backdoors",
+    8000: "Alternate HTTP / web apps",
+    8080: "Alternate HTTP / proxies / device admin pages",
+    8443: "Alternate HTTPS / device admin UIs",
+    8888: "Alternate HTTP / tools dashboards",
+    9050: "Tor SOCKS proxy",
+    9051: "Tor control port",
+    9999: "Common custom services / backdoors",
+    12345: "Historic NetBus Trojan default port",
+    31337: "Historic Back Orifice Trojan port (elite leet)",
+    49152: "Windows dynamic/RPC range start; some IoT UPnP",
+}
+
+
+def describe_port(port: int) -> str:
+    """Plain-English normal use for a TCP/UDP port."""
+    if not port:
+        return "unknown / not applicable"
+    known = PORT_USAGE.get(int(port))
+    if known:
+        return known
+    if 49152 <= int(port) <= 65535:
+        return "ephemeral/dynamic client port (or uncommon high service port)"
+    if 1024 <= int(port) <= 49151:
+        return "registered/user service port (uncommon in this scan list)"
+    return "well-known system port (not in local glossary)"
+
+
+def format_port_explained(port: int) -> str:
+    return f"{port} = {describe_port(port)}"
+
+
+def explain_ports(ports: Sequence[int], indent: str = "    ") -> None:
+    """Print analyst-facing explanations for a list of ports."""
+    for p in ports:
+        print(f"{indent}{format_port_explained(int(p))}")
+
 # Always skip these locals / specials
 PRIVATE_SKIP_PREFIXES = (
     "127.", "::1", "0.0.0.0", "*",
@@ -646,13 +725,22 @@ def score_connection(
     listening = state in ("LISTEN", "LISTENING")
 
     if listening and conn.local_port in SUSPICIOUS_LISTEN_PORTS:
-        reasons.append(f"suspicious listening port {conn.local_port}")
+        reasons.append(
+            f"suspicious listening port {conn.local_port} "
+            f"({describe_port(conn.local_port)})"
+        )
 
     if state in ("ESTABLISHED", "SYN_SENT", "SYN_RECEIVED") or state == "UDP":
         if conn.remote_port in SUSPICIOUS_REMOTE_PORTS:
-            reasons.append(f"suspicious remote port {conn.remote_port}")
+            reasons.append(
+                f"suspicious remote port {conn.remote_port} "
+                f"({describe_port(conn.remote_port)})"
+            )
         if conn.local_port in SUSPICIOUS_REMOTE_PORTS and not is_local_or_skip(remote):
-            reasons.append(f"suspicious local port {conn.local_port} with remote peer")
+            reasons.append(
+                f"suspicious local port {conn.local_port} with remote peer "
+                f"({describe_port(conn.local_port)})"
+            )
 
     pname = (conn.process_name or "").lower()
     base = Path(pname).stem.lower() if pname else ""
@@ -996,9 +1084,16 @@ def connections_to_ip(ip: str, all_conns: Optional[List[Connection]] = None) -> 
 
 
 def format_conn_line(c: Connection) -> str:
+    local_use = describe_port(c.local_port) if c.local_port else ""
+    remote_use = describe_port(c.remote_port) if c.remote_port else ""
+    tip = ""
+    if c.remote_port:
+        tip = f"  | remote port normally: {remote_use}"
+    elif c.local_port and c.state.upper() in ("LISTEN", "LISTENING"):
+        tip = f"  | listen port normally: {local_use}"
     return (
         f"    {c.proto}  {c.local_ip}:{c.local_port}  ->  "
-        f"{c.remote_ip}:{c.remote_port}  [{c.state}]"
+        f"{c.remote_ip}:{c.remote_port}  [{c.state}]{tip}"
     )
 
 
@@ -1017,6 +1112,10 @@ def show_threat_view(
         f"  Link   : {finding.proto} {finding.local_ip}:{finding.local_port} -> "
         f"{finding.remote_ip}:{finding.remote_port}  ({finding.state})"
     )
+    if finding.remote_port:
+        print(f"  Remote port normally used for: {describe_port(finding.remote_port)}")
+    if finding.local_port:
+        print(f"  Local port normally used for : {describe_port(finding.local_port)}")
 
     remote_name = reverse_dns(finding.remote_ip)
     if remote_name:
@@ -1040,6 +1139,9 @@ def show_threat_view(
                 f"  Open ports : "
                 + (",".join(str(p) for p in host.open_ports) if host.open_ports else "-")
             )
+            if host.open_ports:
+                print("  Port meanings (what these are normally used for):")
+                explain_ports(host.open_ports, indent="    ")
             if host.is_gateway:
                 print("  Note       : this is your default gateway (protected from block)")
         related = connections_to_ip(finding.remote_ip)
@@ -1079,6 +1181,18 @@ def show_threat_view(
             extra = reverse_dns(c.remote_ip)
             suffix = f"  dns={extra}" if extra else ""
             print(format_conn_line(c) + suffix)
+        # Deduplicate port explanations for analyst
+        ports_seen = sorted(
+            {
+                p
+                for c in related
+                for p in (c.local_port, c.remote_port)
+                if p and (p in PORT_USAGE or p in SUSPICIOUS_REMOTE_PORTS or p in SUSPICIOUS_LISTEN_PORTS)
+            }
+        )
+        if ports_seen:
+            print("  Flagged/notable port meanings:")
+            explain_ports(ports_seen, indent="    ")
         if len(related) > 40:
             print(f"    ... +{len(related) - 40} more")
     else:
@@ -2383,14 +2497,12 @@ def scan_lan(
 
         bad_open = [p for p in host.open_ports if p in SUSPICIOUS_LISTEN_PORTS or p in (23, 2323, 7547)]
         if bad_open:
-            host.reasons.append(
-                "suspicious open port(s): " + ",".join(str(p) for p in bad_open)
-            )
+            explained = ", ".join(f"{p} ({describe_port(p)})" for p in bad_open)
+            host.reasons.append("suspicious open port(s): " + explained)
         risky_extra = [p for p in host.open_ports if p in (5555, 49152) and p not in bad_open]
         if risky_extra:
-            host.reasons.append(
-                "risky service port(s): " + ",".join(str(p) for p in risky_extra)
-            )
+            explained = ", ".join(f"{p} ({describe_port(p)})" for p in risky_extra)
+            host.reasons.append("risky service port(s): " + explained)
 
         if host.reasons:
             fp = {
@@ -2468,7 +2580,24 @@ def print_lan_inventory(hosts: List[LanHost]) -> None:
             f"  {h.ip:<16} {(h.hostname or '-'):<28} {(h.mac or '-'):<20} "
             f"{ports}{flag_s}"
         )
+        if h.open_ports:
+            for p in h.open_ports:
+                print(f"      port {format_port_explained(p)}")
     print()
+
+
+def print_finding(conn: Connection) -> None:
+    reasons = "; ".join(conn.reasons)
+    print(
+        f"  [{conn.proto}] {conn.local_ip}:{conn.local_port} -> "
+        f"{conn.remote_ip}:{conn.remote_port}  state={conn.state}  "
+        f"pid={conn.pid or '-'}  process={conn.process_name or '-'}  "
+        f"reason={reasons}"
+    )
+    if conn.remote_port:
+        print(f"      remote port {format_port_explained(conn.remote_port)}")
+    if conn.local_port and conn.state.upper() in ("LISTEN", "LISTENING", "LAN_HOST"):
+        print(f"      local/open port {format_port_explained(conn.local_port)}")
 
 
 # ---------------------------------------------------------------------------
@@ -2496,16 +2625,6 @@ def ensure_default_lists() -> None:
             "192.168.1.102  ROKU\n",
             encoding="utf-8",
         )
-
-
-def print_finding(conn: Connection) -> None:
-    reasons = "; ".join(conn.reasons)
-    print(
-        f"  [{conn.proto}] {conn.local_ip}:{conn.local_port} -> "
-        f"{conn.remote_ip}:{conn.remote_port}  state={conn.state}  "
-        f"pid={conn.pid or '-'}  process={conn.process_name or '-'}  "
-        f"reason={reasons}"
-    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
