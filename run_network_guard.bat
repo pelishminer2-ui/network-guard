@@ -4,7 +4,7 @@ title Network Guard
 cd /d "%~dp0"
 
 echo ============================================
-echo  Network Guard - intrusion scan and block
+echo  Network Guard - local + LAN triage
 echo ============================================
 echo.
 
@@ -30,11 +30,12 @@ if errorlevel 1 (
   exit /b 0
 )
 
-echo Running elevated. Scanning and remediating...
+echo Running elevated.
+echo For each threat you can View / Kill / Block / Allow / Skip.
 echo.
-REM Default: auto-confirm blocks. Add --dry-run to report only.
-REM Add --kill to also terminate offending processes.
-%PY% "%~dp0network_guard.py" --yes %*
+REM Interactive by default. Pass --yes for unattended auto-block.
+REM Pass --dry-run to inspect without changing anything.
+%PY% "%~dp0network_guard.py" --lan %*
 set "EC=%ERRORLEVEL%"
 echo.
 echo Exit code: %EC%

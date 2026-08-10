@@ -1,5 +1,9 @@
 # Runtime / local
 network_guard.log
+router_block_candidates.txt
+agent_token.txt
+allowlist_state.json
+ui_captures/
 *.log
 __pycache__/
 *.py[cod]
