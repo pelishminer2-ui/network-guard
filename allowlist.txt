@@ -1,5 +1,7 @@
-# One IP or CIDR per line. These remotes are never blocked.
+# One IP or CIDR per line. Allowed devices are not re-prompted
+# unless their traffic gets worse than when you allowed them.
 # Examples:
 # 192.168.1.0/24
 # 10.0.0.0/8
-# 8.8.8.8
+192.168.1.102  # allowed 2026-08-10T11:43:53 name=ROKU
+192.168.1.107  # allowed 2026-08-10T11:44:22
