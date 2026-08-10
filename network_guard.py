@@ -51,7 +51,7 @@ SUSPICIOUS_LISTEN_PORTS: Set[int] = {
 LAN_PROBE_PORTS: Tuple[int, ...] = tuple(
     sorted(
         SUSPICIOUS_LISTEN_PORTS
-        | {23, 2323, 3389, 5555, 7547, 49152, 5000, 8000, 8080, 8443}
+        | {23, 2323, 3389, 5555, 7547, 49152, 5000, 8000, 8080, 8443, 8060}
     )
 )
 
@@ -104,6 +104,7 @@ PORT_USAGE: Dict[int, str] = {
     7547: "TR-069 router/modem remote management (often probed)",
     7777: "Game servers / occasional backdoors",
     8000: "Alternate HTTP / web apps",
+    8060: "Roku External Control Protocol (ECP) — device status / remote API",
     8080: "Alternate HTTP / proxies / device admin pages",
     8443: "Alternate HTTPS / device admin UIs",
     8888: "Alternate HTTP / tools dashboards",
@@ -206,7 +207,7 @@ def is_admin() -> bool:
 def log(msg: str, log_path: Path) -> None:
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {msg}"
-    print(line)
+    print(line, flush=True)
     try:
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
@@ -483,33 +484,116 @@ def parse_endpoint(endpoint: str) -> Tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Process name resolution
+# Process name resolution (bulk — never call tasklist per socket)
 # ---------------------------------------------------------------------------
+
+_PROCESS_NAME_CACHE: Dict[int, str] = {}
+_PROCESS_MAP_LOADED = False
+
+
+def disable_console_quick_edit() -> None:
+    """Prevent Windows console 'Select' mode from pausing the script on click."""
+    if not is_windows():
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        hin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(hin, ctypes.byref(mode)):
+            return
+        ENABLE_QUICK_EDIT = 0x0040
+        ENABLE_EXTENDED = 0x0080
+        new_mode = (mode.value | ENABLE_EXTENDED) & ~ENABLE_QUICK_EDIT
+        kernel32.SetConsoleMode(hin, new_mode)
+    except Exception:
+        pass
+
+
+def load_process_name_map(force: bool = False) -> Dict[int, str]:
+    """Load PID -> process name once for the whole scan."""
+    global _PROCESS_NAME_CACHE, _PROCESS_MAP_LOADED
+    if _PROCESS_MAP_LOADED and not force:
+        return _PROCESS_NAME_CACHE
+
+    mapping: Dict[int, str] = {}
+    if is_windows():
+        code, out, _ = run_cmd(["tasklist", "/FO", "CSV", "/NH"], timeout=60)
+        if code == 0 and out.strip():
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = next(csv.reader([line]))
+                    if len(row) >= 2:
+                        name = row[0].strip().strip('"')
+                        pid_s = row[1].strip().strip('"')
+                        if pid_s.isdigit():
+                            mapping[int(pid_s)] = name
+                except Exception:
+                    continue
+    else:
+        code, out, _ = run_cmd(["ps", "-eo", "pid=,comm="], timeout=30)
+        if code == 0:
+            for line in out.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    mapping[int(parts[0])] = parts[1]
+        # Prefer /proc comm when present
+        try:
+            for proc in Path("/proc").iterdir():
+                if proc.name.isdigit():
+                    try:
+                        mapping[int(proc.name)] = (
+                            (proc / "comm").read_text(encoding="utf-8", errors="ignore").strip()
+                        )
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    _PROCESS_NAME_CACHE = mapping
+    _PROCESS_MAP_LOADED = True
+    return _PROCESS_NAME_CACHE
+
 
 def process_name_for_pid(pid: Optional[int]) -> str:
     if not pid or pid <= 0:
         return ""
+    cache = load_process_name_map()
+    if pid in cache:
+        return cache[pid]
+    # Rare miss: single lookup fallback
     if is_windows():
         code, out, _ = run_cmd(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"]
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            timeout=10,
         )
         if code == 0 and out.strip():
             try:
                 row = next(csv.reader([out.strip().splitlines()[0]]))
                 if row:
-                    return row[0].strip('"')
+                    name = row[0].strip('"')
+                    _PROCESS_NAME_CACHE[pid] = name
+                    return name
             except Exception:
                 pass
         return ""
-    # Linux: /proc/<pid>/comm
     comm = Path(f"/proc/{pid}/comm")
     if comm.exists():
         try:
-            return comm.read_text(encoding="utf-8", errors="ignore").strip()
+            name = comm.read_text(encoding="utf-8", errors="ignore").strip()
+            _PROCESS_NAME_CACHE[pid] = name
+            return name
         except OSError:
             pass
-    code, out, _ = run_cmd(["ps", "-p", str(pid), "-o", "comm="])
-    return out.strip() if code == 0 else ""
+    code, out, _ = run_cmd(["ps", "-p", str(pid), "-o", "comm="], timeout=5)
+    name = out.strip() if code == 0 else ""
+    if name:
+        _PROCESS_NAME_CACHE[pid] = name
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -758,14 +842,25 @@ def enrich_and_detect(
     blocklist: Set[str],
     allow_state: Optional[Dict[str, dict]] = None,
     state_path: Path = DEFAULT_ALLOW_STATE,
+    log_path: Optional[Path] = None,
 ) -> List[Connection]:
     findings: List[Connection] = []
     seen: Set[str] = set()
     state = allow_state if allow_state is not None else load_allow_state(state_path)
     device_names = load_device_names()
+
+    if log_path:
+        log("Loading process list (one-shot)...", log_path)
+    proc_map = load_process_name_map(force=True)
+    if log_path:
+        log(f"Process map ready ({len(proc_map)} PIDs). Scoring sockets...", log_path)
+
+    # Fill names from cache only (no per-socket tasklist)
     for conn in connections:
         if not conn.process_name and conn.pid:
-            conn.process_name = process_name_for_pid(conn.pid)
+            conn.process_name = proc_map.get(conn.pid, "")
+
+    for conn in connections:
         # Prefer friendly LAN device name when talking to a known IP
         if conn.remote_ip in device_names and not conn.process_name:
             conn.process_name = device_names[conn.remote_ip]
@@ -790,6 +885,9 @@ def enrich_and_detect(
             continue
         seen.add(conn.key)
         findings.append(conn)
+
+    if log_path:
+        log(f"Local scoring complete — {len(findings)} finding(s).", log_path)
     return findings
 
 
@@ -1154,8 +1252,8 @@ def show_threat_view(
         else:
             print("    (none right now - device is reachable/open but idle toward you)")
         print(
-            "  Note: press [U] for quiet browser watch "
-            "(agent/local capture only; no RDP). Use [V] for network-only."
+            "  Note: [U] quiet watch = this PC browser only. Local captures save to ui_captures\\ "
+            "on THIS PC (not uploaded). LAN screens need the agent; IoT may open http://IP:port instead."
         )
         print("=" * 64)
         return
@@ -1437,6 +1535,254 @@ def agent_reachable(ip: str, token: str, port: int = AGENT_PORT) -> bool:
             return resp.status == 200
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Roku / smart-TV status (ECP) — closest thing to an "image" without HDMI capture
+# ---------------------------------------------------------------------------
+
+ROKU_ECP_PORT = 8060
+# Common Roku MAC OUI prefixes (lowercase, colon form)
+ROKU_MAC_OUIS = (
+    "7c:67:ab",
+    "b8:a1:75",
+    "dc:3a:5e",
+    "d8:31:34",
+    "ac:ae:19",
+    "cc:6d:a0",
+)
+
+
+def _http_get(url: str, timeout: float = 3.0) -> Tuple[bytes, str]:
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "NetworkGuard/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        ctype = resp.headers.get("Content-Type", "") or ""
+        return resp.read(), ctype
+
+
+def xml_tag_text(xml: str, tag: str) -> str:
+    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", xml, re.I | re.S)
+    if not m:
+        return ""
+    return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+
+
+def xml_attr(xml: str, tag: str, attr: str) -> str:
+    m = re.search(rf"<{tag}\b([^>]*)>", xml, re.I)
+    if not m:
+        return ""
+    attrs = m.group(1)
+    m2 = re.search(rf'\b{attr}="([^"]*)"', attrs, re.I)
+    return m2.group(1).strip() if m2 else ""
+
+
+def looks_like_roku(ip: str, friendly: str = "", host: Optional[LanHost] = None) -> bool:
+    if friendly and "roku" in friendly.lower():
+        return True
+    if host and host.hostname and "roku" in host.hostname.lower():
+        return True
+    if host and host.mac:
+        mac = host.mac.lower().replace("-", ":")
+        if any(mac.startswith(oui) for oui in ROKU_MAC_OUIS):
+            return True
+    if host and ROKU_ECP_PORT in (host.open_ports or []):
+        return True
+    return tcp_port_open(ip, ROKU_ECP_PORT, timeout=0.45)
+
+
+def fetch_roku_status(ip: str) -> Dict[str, object]:
+    """
+    Query Roku External Control Protocol (port 8060).
+    Returns text status + optional app icon bytes (an actual image).
+    Full TV picture of DRM streams is not available via ECP.
+    """
+    base = f"http://{ip}:{ROKU_ECP_PORT}"
+    out: Dict[str, object] = {
+        "reachable": False,
+        "user_device_name": "",
+        "model_name": "",
+        "model_number": "",
+        "software_version": "",
+        "vendor_name": "",
+        "active_app": "",
+        "active_app_id": "",
+        "screensaver": "",
+        "player_state": "",
+        "player_position": "",
+        "raw_device_info": "",
+        "raw_active_app": "",
+        "raw_media_player": "",
+        "icon_bytes": b"",
+        "icon_ctype": "",
+        "error": "",
+    }
+    try:
+        raw, _ = _http_get(f"{base}/query/device-info", timeout=3.0)
+        xml = raw.decode("utf-8", "ignore")
+        out["reachable"] = True
+        out["raw_device_info"] = xml
+        out["user_device_name"] = xml_tag_text(xml, "user-device-name")
+        out["model_name"] = xml_tag_text(xml, "model-name")
+        out["model_number"] = xml_tag_text(xml, "model-number")
+        out["software_version"] = xml_tag_text(xml, "software-version")
+        out["vendor_name"] = xml_tag_text(xml, "vendor-name")
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"device-info failed: {exc}"
+        return out
+
+    try:
+        raw, _ = _http_get(f"{base}/query/active-app", timeout=3.0)
+        xml = raw.decode("utf-8", "ignore")
+        out["raw_active_app"] = xml
+        out["active_app"] = xml_tag_text(xml, "app") or "Roku"
+        out["active_app_id"] = xml_attr(xml, "app", "id")
+        out["screensaver"] = xml_tag_text(xml, "screensaver")
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = (str(out.get("error") or "") + f" active-app: {exc}").strip()
+
+    try:
+        raw, _ = _http_get(f"{base}/query/media-player", timeout=3.0)
+        xml = raw.decode("utf-8", "ignore")
+        out["raw_media_player"] = xml
+        out["player_state"] = xml_attr(xml, "player", "state") or xml_tag_text(xml, "state")
+        out["player_position"] = xml_tag_text(xml, "position")
+    except Exception:
+        pass
+
+    app_id = str(out.get("active_app_id") or "").strip()
+    if app_id and app_id.isdigit():
+        try:
+            icon, ctype = _http_get(f"{base}/query/icon/{app_id}", timeout=4.0)
+            if icon and len(icon) > 32:
+                out["icon_bytes"] = icon
+                out["icon_ctype"] = ctype or "image/png"
+        except Exception:
+            pass
+    return out
+
+
+def open_roku_visual_status(
+    ip: str,
+    friendly: str,
+    log_path: Path,
+) -> bool:
+    """
+    Build a local HTML status page with Roku app icon (image) + what is active,
+    save icon under ui_captures, and open it in the default browser.
+    """
+    import base64
+    import webbrowser
+
+    print(f"  Querying Roku ECP on {ip}:{ROKU_ECP_PORT} ...")
+    st = fetch_roku_status(ip)
+    if not st.get("reachable"):
+        print(f"  Roku ECP not reachable ({st.get('error') or 'no response'}).")
+        print("  Tip: On the Roku, Settings → System → Advanced system settings →")
+        print("       Control by mobile apps → Network access → enable / set to 'Enabled'.")
+        return False
+
+    UI_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    icon_rel = ""
+    icon_bytes = st.get("icon_bytes") or b""
+    if isinstance(icon_bytes, (bytes, bytearray)) and icon_bytes:
+        ext = "jpg" if "jpeg" in str(st.get("icon_ctype", "")).lower() else "png"
+        icon_path = UI_CAPTURE_DIR / f"roku_{ip.replace('.', '_')}_appicon.{ext}"
+        icon_path.write_bytes(bytes(icon_bytes))
+        icon_rel = icon_path.name
+        print(f"  Saved app icon image: {icon_path}")
+        try:
+            if is_windows():
+                os.startfile(str(icon_path))  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+    def esc(s: object) -> str:
+        return (
+            str(s or "-")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    b64 = ""
+    if isinstance(icon_bytes, (bytes, bytearray)) and icon_bytes:
+        b64 = base64.b64encode(bytes(icon_bytes)).decode("ascii")
+        mime = str(st.get("icon_ctype") or "image/png").split(";")[0]
+
+    img_html = (
+        f'<img alt="Active Roku app icon" src="data:{mime};base64,{b64}" '
+        f'style="max-width:240px;border-radius:16px;background:#111"/>'
+        if b64
+        else '<div style="padding:24px;color:#aaa">No app icon available for this channel</div>'
+    )
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"/>
+<title>Roku status - {esc(friendly)}</title>
+<style>
+ body{{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#0b0d10;color:#f2f4f8}}
+ header{{background:linear-gradient(90deg,#1b3a6b,#2b6cb0);padding:16px 20px}}
+ h1{{margin:0 0 6px;font-size:24px}} .sub{{opacity:.9}}
+ main{{padding:20px;display:grid;gap:16px;grid-template-columns:280px 1fr;max-width:1000px}}
+ .card{{background:#151a22;border:1px solid #2a3344;border-radius:12px;padding:16px}}
+ .k{{color:#9ecbff;font-size:12px;text-transform:uppercase;letter-spacing:.06em}}
+ .v{{font-size:18px;margin:4px 0 12px}}
+ note{{display:block;margin-top:10px;color:#b0b8c4;font-size:13px;line-height:1.4}}
+ @media (max-width:800px){{main{{grid-template-columns:1fr}}}}
+</style></head>
+<body>
+<header>
+  <div class="k">Roku device status (ECP)</div>
+  <h1>{esc(st.get('user_device_name') or friendly)}</h1>
+  <div class="sub">{esc(ip)} · {esc(st.get('model_name'))} · {esc(st.get('model_number'))}</div>
+</header>
+<main>
+  <div class="card" style="text-align:center">
+    <div class="k">Active app image</div>
+    <div style="margin-top:12px">{img_html}</div>
+    <note>This is the channel icon from Roku, not a live TV frame.
+    DRM apps (Netflix, etc.) do not expose a full screen grab over the network.</note>
+  </div>
+  <div class="card">
+    <div class="k">Active app</div>
+    <div class="v">{esc(st.get('active_app'))}
+      {"(id " + esc(st.get('active_app_id')) + ")" if st.get('active_app_id') else ""}</div>
+    <div class="k">Screensaver</div>
+    <div class="v">{esc(st.get('screensaver') or 'none')}</div>
+    <div class="k">Media player</div>
+    <div class="v">{esc(st.get('player_state') or 'unknown')}
+      {" · " + esc(st.get('player_position')) if st.get('player_position') else ""}</div>
+    <div class="k">Software</div>
+    <div class="v">{esc(st.get('software_version'))}</div>
+    <note>Saved under ui_captures on this PC only. For a real picture of the TV screen,
+    use an HDMI capture device, or photograph the TV. Network Guard cannot bypass
+    streaming-app copy protection.</note>
+  </div>
+</main>
+</body></html>
+"""
+    page = UI_CAPTURE_DIR / f"roku_{ip.replace('.', '_')}_status.html"
+    page.write_text(html, encoding="utf-8")
+    print(f"  Roku status page: {page}")
+    print(f"  Active app: {st.get('active_app') or '-'} | player: {st.get('player_state') or '-'}")
+    if icon_rel:
+        print(f"  App icon file: {UI_CAPTURE_DIR / icon_rel}")
+    log(
+        f"ROKU status {ip} app={st.get('active_app')} player={st.get('player_state')} icon={bool(b64)}",
+        log_path,
+    )
+    try:
+        webbrowser.open(page.as_uri(), new=2)
+    except Exception as exc:
+        log(f"Failed opening Roku status page: {exc}", log_path)
+        if is_windows():
+            try:
+                os.startfile(str(page))  # type: ignore[attr-defined]
+            except OSError:
+                pass
+    return True
 
 
 def open_rdp(ip: str, log_path: Path) -> Optional[subprocess.Popen]:
@@ -2023,12 +2369,80 @@ def view_compromised_ui(
         )
         return
 
-    print("  No Network Guard Agent on that device - cannot quietly view its screen.")
-    print("  Quiet options:")
+    print("  No Network Guard Agent on that device.")
+    print("  Important: 'local capture' means THIS PC's screen only.")
+    print(f"  Image files (when a capture runs) are saved under: {UI_CAPTURE_DIR}")
+    print("  They are NOT uploaded anywhere - browser opens on this PC only.")
+    print()
+
+    # Roku / similar: ECP status + app icon image (best available without HDMI)
+    if looks_like_roku(ip, friendly, host):
+        print(f"  Detected Roku-class device ({friendly}).")
+        print("  Pulling status + channel icon via Roku ECP (port 8060)...")
+        if open_roku_visual_status(ip, friendly, log_path):
+            print("  Opened Roku status page with app image in your browser.")
+        else:
+            print("  Could not query Roku ECP. Enable 'Control by mobile apps' on the Roku.")
+        # Still try HTTP ports (e.g. 8888) as extra context
+        web_ports = [
+            p
+            for p in ((host.open_ports if host else []) or [])
+            if p in (80, 443, 8000, 8080, 8443, 8888, 5000, 9000)
+        ]
+        if finding.remote_port in (80, 443, 8000, 8080, 8443, 8888, 5000, 9000):
+            if finding.remote_port not in web_ports:
+                web_ports.insert(0, finding.remote_port)
+        if web_ports:
+            import webbrowser
+
+            print("  Also opening HTTP service port(s):")
+            for p in web_ports:
+                scheme = "https" if p in (443, 8443) else "http"
+                url = f"{scheme}://{ip}:{p}/"
+                print(f"    {url}")
+                try:
+                    webbrowser.open(url, new=2)
+                except Exception:
+                    pass
+        print("  Note: live full-screen TV video still needs HDMI capture or a photo of the TV.")
+        return
+
+    print(f"  {friendly} cannot run the agent (TV/IoT/phone), so there is no desktop")
+    print("  screenshot stream. If it exposes a web page, we can open that instead.")
+
+    web_ports = []
+    if host:
+        web_ports = [
+            p
+            for p in (host.open_ports or [])
+            if p in (80, 443, 8000, 8080, 8443, 8888, 5000, 9000)
+        ]
+    if finding.remote_port and finding.remote_port not in web_ports:
+        if finding.remote_port in (80, 443, 8000, 8080, 8443, 8888, 5000, 9000):
+            web_ports.insert(0, finding.remote_port)
+
+    if web_ports:
+        import webbrowser
+
+        print("  Opening device web UI(s) in your browser:")
+        for p in web_ports:
+            scheme = "https" if p in (443, 8443) else "http"
+            url = f"{scheme}://{ip}:{p}/"
+            print(f"    {url}  ({describe_port(p)})")
+            try:
+                webbrowser.open(url, new=2)
+            except Exception as exc:
+                log(f"Failed to open {url}: {exc}", log_path)
+        print("  If the page loads, that is the service on the flagged port.")
+        print("  If it fails, the port may not be a normal web UI.")
+    else:
+        print("  No HTTP-style ports to open for this device.")
+        print("  Use [V] to watch network activity, or Allow/Block/Skip.")
+
+    print("  Quiet agent install (Windows/Linux PCs you own only):")
     print("    1) Copy run_network_guard_agent.bat + network_guard_agent.py to that PC")
     print("    2) Run the agent there, keep agent_token.txt identical on both PCs")
     print("    3) Press [U] again")
-    print("  Or use [V] to watch network activity only (no screen, fully quiet).")
     if not token:
         print(f"  Missing token file: {AGENT_TOKEN_FILE}")
 
@@ -2710,6 +3124,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     ensure_default_lists()
     log_path: Path = args.log
+    disable_console_quick_edit()
 
     log("=" * 60, log_path)
     log(
@@ -2747,8 +3162,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     allowlist,
                     blocklist,
                     allow_state=load_allow_state(),
+                    log_path=log_path,
                 )
             )
+            log(f"Local findings: {len(findings)}. Starting LAN phase (if enabled)...", log_path)
 
         if args.lan:
             try:
