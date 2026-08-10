@@ -1,0 +1,20 @@
+# Runtime / local
+network_guard.log
+*.log
+__pycache__/
+*.py[cod]
+*.pyc
+.Python
+.venv/
+venv/
+.env
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

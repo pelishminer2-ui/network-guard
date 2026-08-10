@@ -1,0 +1,2 @@
+# Known-bad IPs / CIDRs. Matching remotes are always flagged and blocked.
+# One IP or CIDR per line. Network Guard also appends IPs it blocks.
